@@ -1,0 +1,26 @@
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+
+# Database and uploaded invoices
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+backend/storage/
+backend/uploads/
+
+# React / Node
+node_modules/
+frontend/dist/
+dist/
+
+# Local settings and temporary files
+.vscode/
+*.log
+.DS_Store
