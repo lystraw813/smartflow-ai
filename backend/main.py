@@ -6,58 +6,156 @@ import shutil
 import sqlite3
 import uuid
 import io
+import os
+import ssl
+import threading
+from urllib.parse import urlparse, unquote
+import pymysql
 from decimal import Decimal, InvalidOperation
 from pypdf import PdfReader
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 BASE = Path(__file__).resolve().parent
 DATABASE = BASE / 'smartflow.db'
 STORAGE = BASE / 'storage' / 'invoices'
-STORAGE.mkdir(parents=True, exist_ok=True)
+DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+USE_MYSQL = bool(DATABASE_URL)
 MAX_PDF_BYTES = 10 * 1024 * 1024
 
-app = FastAPI(title='SmartFlow AI Invoice Automation', version='0.2.0')
-app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:5173', 'http://127.0.0.1:5173'], allow_methods=['GET', 'POST'], allow_headers=['*'])
+app = FastAPI(title='SmartFlow AI Invoice Automation', version='0.3.0')
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        'http://localhost:5173', 'http://127.0.0.1:5173',
+        'https://smartflow-ai.enzonic.dev',
+    ],
+    allow_methods=['GET', 'POST'], allow_headers=['*'],
+)
+
+# Keep existing SQLite behavior locally; use Enzonic MySQL when DATABASE_URL is set.
+# The lightweight wrapper lets existing SQL and API handlers remain unchanged.
+class DatabaseConnection:
+    def __init__(self, raw, mysql):
+        self.raw, self.mysql = raw, mysql
+
+    def execute(self, sql, params=()):
+        if not self.mysql:
+            return self.raw.execute(sql, params)
+        cursor = self.raw.cursor()
+        cursor.execute(sql.replace('?', '%s'), params)
+        return cursor
+
+    def commit(self):
+        self.raw.commit()
+
+    def rollback(self):
+        self.raw.rollback()
+
+    def close(self):
+        self.raw.close()
+
+
+def open_connection():
+    if not USE_MYSQL:
+        conn = sqlite3.connect(DATABASE, timeout=20)
+        conn.row_factory = sqlite3.Row
+        return DatabaseConnection(conn, False)
+    parsed = urlparse(DATABASE_URL)
+    if parsed.scheme not in ('mysql', 'mysql+pymysql'):
+        raise RuntimeError('DATABASE_URL must be a MySQL connection URL')
+    if not parsed.hostname or not parsed.username:
+        raise RuntimeError('DATABASE_URL is missing MySQL connection information')
+    # Enzonic requires TLS. Verify the server certificate and hostname.
+    raw = pymysql.connect(
+        host=parsed.hostname, port=parsed.port or 3306,
+        user=unquote(parsed.username), password=unquote(parsed.password or ''),
+        database=unquote(parsed.path.lstrip('/')),
+        charset='utf8mb4', cursorclass=pymysql.cursors.DictCursor,
+        ssl=ssl.create_default_context(), connect_timeout=15,
+        read_timeout=30, write_timeout=30, autocommit=False,
+    )
+    return DatabaseConnection(raw, True)
+
+_schema_lock = threading.Lock()
+_schema_ready = False
+
+
+def initialize_schema(conn):
+    if USE_MYSQL:
+        conn.execute('''CREATE TABLE IF NOT EXISTS invoices (
+            id BIGINT PRIMARY KEY AUTO_INCREMENT,
+            vendor VARCHAR(255) NOT NULL,
+            number VARCHAR(255) NOT NULL,
+            amount DOUBLE NOT NULL,
+            due_date VARCHAR(10) NOT NULL,
+            status VARCHAR(50) NOT NULL,
+            document_path VARCHAR(512) NULL,
+            created_at VARCHAR(40) NOT NULL,
+            updated_at VARCHAR(40) NOT NULL,
+            payment_status VARCHAR(20) NOT NULL DEFAULT 'Unpaid',
+            paid_at VARCHAR(40) NULL,
+            UNIQUE KEY uq_invoice (vendor, number)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS audit_events (
+            id BIGINT PRIMARY KEY AUTO_INCREMENT,
+            invoice_id BIGINT NOT NULL,
+            event VARCHAR(255) NOT NULL,
+            created_at VARCHAR(40) NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS invoice_documents (
+            invoice_id BIGINT PRIMARY KEY,
+            content LONGBLOB NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4''')
+    else:
+        STORAGE.mkdir(parents=True, exist_ok=True)
+        conn.execute('''CREATE TABLE IF NOT EXISTS invoices (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          vendor TEXT NOT NULL,
+          number TEXT NOT NULL,
+          amount REAL NOT NULL,
+          due_date TEXT NOT NULL,
+          status TEXT NOT NULL,
+          document_path TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(vendor, number)
+        )''')
+        existing_columns = {row['name'] for row in conn.execute('PRAGMA table_info(invoices)')}
+        if 'payment_status' not in existing_columns:
+            conn.execute("ALTER TABLE invoices ADD COLUMN payment_status TEXT NOT NULL DEFAULT 'Unpaid'")
+        if 'paid_at' not in existing_columns:
+            conn.execute('ALTER TABLE invoices ADD COLUMN paid_at TEXT')
+        conn.execute('''CREATE TABLE IF NOT EXISTS audit_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          invoice_id INTEGER NOT NULL,
+          event TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        )''')
+    conn.commit()
+
 
 @contextmanager
 def db():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
+    global _schema_ready
+    conn = open_connection()
     try:
-        yield conn
-        conn.commit()
+        if not _schema_ready:
+            with _schema_lock:
+                if not _schema_ready:
+                    initialize_schema(conn)
+                    _schema_ready = True
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     finally:
         conn.close()
-
-with db() as conn:
-    conn.execute('''CREATE TABLE IF NOT EXISTS invoices (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      vendor TEXT NOT NULL,
-      number TEXT NOT NULL,
-      amount REAL NOT NULL,
-      due_date TEXT NOT NULL,
-      status TEXT NOT NULL,
-      document_path TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      UNIQUE(vendor, number)
-    )''')
-    # Add payment fields to existing Version 3 databases without deleting records.
-    existing_columns = {row['name'] for row in conn.execute('PRAGMA table_info(invoices)')}
-    if 'payment_status' not in existing_columns:
-        conn.execute("ALTER TABLE invoices ADD COLUMN payment_status TEXT NOT NULL DEFAULT 'Unpaid'")
-    if 'paid_at' not in existing_columns:
-        conn.execute('ALTER TABLE invoices ADD COLUMN paid_at TEXT')
-    conn.execute('''CREATE TABLE IF NOT EXISTS audit_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      invoice_id INTEGER NOT NULL,
-      event TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    )''')
 
 class Invoice(BaseModel):
     vendor: str = Field(min_length=1)
@@ -97,7 +195,12 @@ def insert_invoice(conn, invoice: Invoice):
         raise HTTPException(409, 'Duplicate vendor and invoice number')
     now = timestamp()
     status = 'Pending Approval' if invoice.amount > 1000 else 'Ready for Review'
-    cur = conn.execute('INSERT INTO invoices(vendor,number,amount,due_date,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)', (vendor, number, invoice.amount, invoice.due_date.isoformat(), status, now, now))
+    try:
+        cur = conn.execute('INSERT INTO invoices(vendor,number,amount,due_date,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)', (vendor, number, invoice.amount, invoice.due_date.isoformat(), status, now, now))
+    except pymysql.err.IntegrityError as exc:
+        if exc.args and exc.args[0] == 1062:
+            raise HTTPException(409, 'Duplicate vendor and invoice number') from exc
+        raise
     log(conn, cur.lastrowid, 'Registered invoice')
     return cur.lastrowid
 
@@ -214,16 +317,21 @@ async def upload_invoice(vendor: str = Form(...), number: str = Form(...), amoun
         raise HTTPException(400, 'File does not appear to be a PDF')
     with db() as conn:
         invoice_id = insert_invoice(conn, invoice)
-        folder = STORAGE / folder_name(invoice.vendor) / 'Pending'
-        folder.mkdir(parents=True, exist_ok=True)
-        destination = folder / f'{invoice_id}_{uuid.uuid4().hex[:10]}.pdf'
-        try:
-            destination.write_bytes(content)
-            conn.execute('UPDATE invoices SET document_path=? WHERE id=?', (str(destination), invoice_id))
-            log(conn, invoice_id, 'Original PDF saved in vendor Pending folder')
-        except Exception:
-            destination.unlink(missing_ok=True)
-            raise
+        if USE_MYSQL:
+            conn.execute('INSERT INTO invoice_documents(invoice_id, content) VALUES(?, ?)', (invoice_id, content))
+            conn.execute('UPDATE invoices SET document_path=? WHERE id=?', ('mysql', invoice_id))
+            log(conn, invoice_id, 'Original PDF saved in MySQL document storage')
+        else:
+            folder = STORAGE / folder_name(invoice.vendor) / 'Pending'
+            folder.mkdir(parents=True, exist_ok=True)
+            destination = folder / f'{invoice_id}_{uuid.uuid4().hex[:10]}.pdf'
+            try:
+                destination.write_bytes(content)
+                conn.execute('UPDATE invoices SET document_path=? WHERE id=?', (str(destination), invoice_id))
+                log(conn, invoice_id, 'Original PDF saved in vendor Pending folder')
+            except Exception:
+                destination.unlink(missing_ok=True)
+                raise
         return row_dict(get_row(conn, invoice_id))
 
 @app.get('/invoices/{invoice_id}/document')
@@ -232,6 +340,14 @@ def view_document(invoice_id: int):
         row = get_row(conn, invoice_id)
         if not row['document_path']:
             raise HTTPException(404, 'No PDF attached to this invoice')
+        if USE_MYSQL:
+            document = conn.execute('SELECT content FROM invoice_documents WHERE invoice_id=?', (invoice_id,)).fetchone()
+            if not document:
+                raise HTTPException(404, 'Invoice PDF not found')
+            return Response(content=document['content'], media_type='application/pdf', headers={
+                'Content-Disposition': f'inline; filename="invoice-{invoice_id}.pdf"',
+                'Cache-Control': 'no-store',
+            })
         path = Path(row['document_path'])
         if not path.is_file() or not path.resolve().is_relative_to(STORAGE.resolve()):
             raise HTTPException(404, 'Invoice PDF not found')
@@ -242,22 +358,29 @@ def transition(invoice_id: int, target: str):
         row = get_row(conn, invoice_id)
         if row['status'] in ('Approved', 'Problem'):
             raise HTTPException(409, 'Invoice has already been finalized')
-        old = Path(row['document_path']) if row['document_path'] else None
-        new_path = None
-        if old:
-            if not old.is_file() or not old.resolve().is_relative_to(STORAGE.resolve()):
-                raise HTTPException(404, 'Original invoice document is missing')
-            folder = STORAGE / folder_name(row['vendor']) / target
-            folder.mkdir(parents=True, exist_ok=True)
-            new_path = folder / old.name
-            shutil.move(str(old), str(new_path))
-        try:
-            conn.execute('UPDATE invoices SET status=?, document_path=?, updated_at=? WHERE id=?', (target if target != 'Problem' else 'Problem', str(new_path) if new_path else None, timestamp(), invoice_id))
+        if USE_MYSQL:
+            # MySQL keeps the PDF attached to the invoice; approval changes its status.
+            conn.execute('UPDATE invoices SET status=?, updated_at=? WHERE id=?',
+                         (target, timestamp(), invoice_id))
             log(conn, invoice_id, 'Status changed to ' + target)
-        except Exception:
-            if old and new_path and new_path.exists():
-                shutil.move(str(new_path), str(old))
-            raise
+        else:
+            old = Path(row['document_path']) if row['document_path'] else None
+            new_path = None
+            if old:
+                if not old.is_file() or not old.resolve().is_relative_to(STORAGE.resolve()):
+                    raise HTTPException(404, 'Original invoice document is missing')
+                folder = STORAGE / folder_name(row['vendor']) / target
+                folder.mkdir(parents=True, exist_ok=True)
+                new_path = folder / old.name
+                shutil.move(str(old), str(new_path))
+            try:
+                conn.execute('UPDATE invoices SET status=?, document_path=?, updated_at=? WHERE id=?',
+                             (target, str(new_path) if new_path else None, timestamp(), invoice_id))
+                log(conn, invoice_id, 'Status changed to ' + target)
+            except Exception:
+                if old and new_path and new_path.exists():
+                    shutil.move(str(new_path), str(old))
+                raise
         return row_dict(get_row(conn, invoice_id))
 
 @app.post('/invoices/{invoice_id}/approve')
