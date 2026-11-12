@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './style.css';
 
-const API = 'http://127.0.0.1:8000';
+const API = 'https://smartflow-api.enzonic.dev';
 const blank = { vendor: '', number: '', amount: '', due_date: '' };
 const money = value => Number(value).toLocaleString('en-US', {style:'currency', currency:'USD'});
 const todayString = () => {
