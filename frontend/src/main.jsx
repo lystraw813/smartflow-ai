@@ -3,6 +3,17 @@ import { createRoot } from 'react-dom/client';
 import './style.css';
 
 const API = 'https://smartflow-api.enzonic.dev';
+const SESSION_STORAGE_KEY = 'smartflow-demo-session-v1';
+function demoSession() {
+  let token = localStorage.getItem(SESSION_STORAGE_KEY);
+  if (!token) {
+    token = crypto.randomUUID();
+    localStorage.setItem(SESSION_STORAGE_KEY, token);
+  }
+  return token;
+}
+const demoHeaders = () => ({'X-Demo-Session': demoSession()});
+
 const blank = { vendor: '', number: '', amount: '', due_date: '' };
 const money = value => Number(value).toLocaleString('en-US', {style:'currency', currency:'USD'});
 const todayString = () => {
@@ -45,7 +56,7 @@ function App() {
 
   async function refresh() {
     try {
-      const response = await fetch(`${API}/invoices`);
+      const response = await fetch(`${API}/invoices`, {headers: demoHeaders()});
       if (!response.ok) throw new Error('Unable to load invoices');
       setItems(await response.json());
     } catch (err) { setError(`Cannot connect to Python API: ${err.message}`); }
@@ -75,9 +86,9 @@ function App() {
         const data = new FormData();
         Object.entries(form).forEach(([key,value]) => data.append(key,value));
         data.append('file',pdf);
-        response = await fetch(`${API}/invoices/upload`, {method:'POST',body:data});
+        response = await fetch(`${API}/invoices/upload`, {method:'POST',headers:demoHeaders(),body:data});
       } else {
-        response = await fetch(`${API}/invoices`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({...form,amount:Number(form.amount)})});
+        response = await fetch(`${API}/invoices`, {method:'POST', headers:{...demoHeaders(),'Content-Type':'application/json'}, body:JSON.stringify({...form,amount:Number(form.amount)})});
       }
       if (!response.ok) {
         const details = await response.json();
@@ -85,7 +96,7 @@ function App() {
       }
       const hadPdf = Boolean(pdf);
       clearForm(); await refresh();
-      setNotice(hadPdf ? 'Invoice PDF saved in the vendor Pending folder.' : 'Invoice registered without a PDF.');
+      setNotice(hadPdf ? 'Invoice PDF saved in your temporary demo workspace.' : 'Invoice registered in your temporary demo workspace.');
     } catch (err) { setError(err.message); }
     finally { setBusy(false); }
   }
@@ -93,16 +104,16 @@ function App() {
   async function invoiceAction(id, action) {
     setError(''); setNotice('');
     try {
-      const response = await fetch(`${API}/invoices/${id}/${action}`, {method:'POST'});
+      const response = await fetch(`${API}/invoices/${id}/${action}`, {method:'POST',headers:demoHeaders()});
       if (!response.ok) {
         const details = await response.json();
         throw new Error(details.detail || 'Action failed');
       }
       await refresh();
       const messages = {
-        approve:'Invoice approved. Its PDF has been moved to the vendor Approved folder.',
-        reject:'Invoice moved to the Problem folder.',
-        'mark-paid':'Payment recorded. The original PDF remains in its Approved folder.',
+        approve:'Invoice approved. Its PDF remains attached to the invoice.',
+        reject:'Invoice flagged as a problem.',
+        'mark-paid':'Payment recorded. The original PDF remains attached.',
         'mark-unpaid':'Payment status changed back to Unpaid.'
       };
       setNotice(messages[action]);
@@ -123,8 +134,24 @@ function App() {
     const d = new Date(calendarYear,calendarMonth+direction,1);
     setCalendarYear(d.getFullYear()); setCalendarMonth(d.getMonth()); setSelectedDay(null);
   }
+  async function openDocument(invoice) {
+    setError('');
+    const tab = window.open('', '_blank');
+    try {
+      const response = await fetch(`${API}/invoices/${invoice.id}/document`, {headers:demoHeaders()});
+      if (!response.ok) throw new Error('Unable to open invoice PDF');
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      if (tab) tab.location.href = url;
+      else { URL.revokeObjectURL(url); throw new Error('Allow pop-ups to view the PDF'); }
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    } catch (err) {
+      if (tab) tab.close();
+      setError(err.message);
+    }
+  }
   function documentLink(invoice) {
-    return invoice.has_document ? <a href={`${API}/invoices/${invoice.id}/document`} target="_blank" rel="noopener noreferrer">View PDF</a> : <span className="muted">No PDF</span>;
+    return invoice.has_document ? <button type="button" className="secondary small-button" onClick={() => openDocument(invoice)}>View PDF</button> : <span className="muted">No PDF</span>;
   }
   function paymentBadge(invoice) {
     if (invoice.payment_status === 'Paid') return <span className="payment-tag paid">Paid</span>;
@@ -148,12 +175,12 @@ function App() {
         <article><label>Overdue invoices</label><strong>{overdue.length}</strong></article>
         <article><label>Due in next 7 days</label><strong>{soon.length}</strong></article>
       </section>
-      {error && <p className="error banner" role="alert">{existingDuplicate ? `Duplicate invoice: ${existingDuplicate.number} from ${existingDuplicate.vendor} already exists (${existingDuplicate.status}).` : error}{existingDuplicate?.has_document && <> <a href={`${API}/invoices/${existingDuplicate.id}/document`} target="_blank" rel="noopener noreferrer">View existing PDF</a></>}</p>}
+      {error && <p className="error banner" role="alert">{existingDuplicate ? `Duplicate invoice: ${existingDuplicate.number} from ${existingDuplicate.vendor} already exists (${existingDuplicate.status}).` : error}{existingDuplicate?.has_document && <> <button type="button" onClick={() => openDocument(existingDuplicate)}>View existing PDF</button></>}</p>}
       {notice && <p className="notice banner" role="status">{notice}</p>}
 
       {view === 'Dashboard' && <section className="panel">
         <h2>Register an invoice</h2>
-        <p>Attach an original PDF to file it immediately under the vendor's Pending folder. Click Extract Details to prefill the form, then review all values before saving.</p>
+        <p>Temporary demo workspace: your saved invoices are separate from other browsers and are deleted after 24 hours. Use fictional or nonconfidential PDFs only. Click Extract Details to prefill the form, then review all values before saving.</p>
         <form onSubmit={submit}>
           {[["vendor","Vendor"],["number","Invoice #"],["amount","Amount"],["due_date","Due date"]].map(([key,label]) => <label key={key}>{label}<input required type={key === 'amount' ? 'number' : key === 'due_date' ? 'date' : 'text'} step={key === 'amount' ? '0.01' : undefined} min={key === 'amount' ? '0.01' : undefined} value={form[key]} onChange={e => setForm({...form,[key]:e.target.value})}/></label>)}
           <label>Original invoice PDF (optional)<input id="invoice-pdf" type="file" accept="application/pdf,.pdf" onChange={e => {setPdf(e.target.files?.[0] || null);setExtractionWarnings([]);}}/></label>
