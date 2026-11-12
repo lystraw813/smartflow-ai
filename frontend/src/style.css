@@ -20,3 +20,15 @@ aside nav{display:flex;flex-direction:column;gap:5px;line-height:normal}
 .small-button{padding:9px 11px;white-space:nowrap}
 @media(max-width:1150px){.stats{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:850px){aside{display:flex;width:100%;padding:14px;gap:8px}aside p,aside small{display:none}aside nav{flex-direction:row;flex-wrap:wrap}.layout{display:block}.calendar-day,.calendar-empty{min-height:65px;padding:5px}.calendar-day small{font-size:9px}.stats{grid-template-columns:repeat(2,1fr)}}
+
+/* Keep invoice form buttons together */
+.actions {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.actions button {
+  white-space: nowrap;
+}

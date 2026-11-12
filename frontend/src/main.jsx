@@ -141,7 +141,7 @@ function App() {
       {['Dashboard','Invoices','Approvals','Payment Calendar'].map(name => <button key={name} className={`nav-item ${view === name ? 'active' : ''}`} onClick={() => {setView(name);setError('');setNotice('');}}>{name}</button>)}
     </nav><small>Automate • Validate • Approve</small></aside>
     <main>
-      <header><h1>{view === 'Payment Calendar' ? 'Payment Calendar' : view === 'Dashboard' ? 'Invoice Command Center' : view}</h1><span>SmartFlow AI · Local Demo</span></header>
+      <header><h1>{view === 'Payment Calendar' ? 'Payment Calendar' : view === 'Dashboard' ? 'Invoice Command Center' : view}</h1><span>SmartFlow AI · Live Demo</span></header>
       <section className="stats">
         <article><label>Total invoices</label><strong>{items.length}</strong></article>
         <article><label>Approved, unpaid</label><strong>{money(unpaid.reduce((sum,i)=>sum+Number(i.amount),0))}</strong></article>
